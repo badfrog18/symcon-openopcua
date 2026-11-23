@@ -1,0 +1,171 @@
+<style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: var(--font-family, system-ui, sans-serif); color: var(--content-color, inherit); font-size: 14px; }
+    .wrap { display: flex; flex-direction: column; height: 100vh; padding: 10px 12px; gap: 8px; }
+    .head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .title { font-weight: 600; font-size: 16px; flex: 1 1 auto; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .title small { display: block; font-weight: 400; font-size: 11px; opacity: .6; }
+    .pill { border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+    .pill.ok { background: rgba(46, 160, 67, .18); color: #2ea043; }
+    .pill.error { background: rgba(218, 54, 51, .18); color: #da3633; }
+    .pill.off, .pill.wait { background: rgba(128, 128, 128, .18); opacity: .8; }
+    .meta { font-size: 11px; opacity: .6; white-space: nowrap; }
+    .err { font-size: 12px; color: #da3633; background: rgba(218, 54, 51, .08); border-radius: 6px; padding: 6px 8px; display: none; }
+    .search { width: 100%; padding: 6px 10px; border-radius: 8px; border: 1px solid rgba(128, 128, 128, .35); background: transparent; color: inherit; font: inherit; }
+    .list { flex: 1 1 auto; overflow: auto; border-radius: 8px; }
+    .group { margin-bottom: 6px; }
+    .ghead { position: sticky; top: 0; z-index: 1; display: flex; justify-content: space-between; cursor: pointer; user-select: none;
+             padding: 5px 8px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em;
+             background: var(--card-color, rgba(128, 128, 128, .12)); backdrop-filter: blur(6px); border-radius: 6px; }
+    .ghead span:last-child { opacity: .55; font-weight: 400; }
+    .group.collapsed .rows { display: none; }
+    .row { display: grid; grid-template-columns: 10px minmax(90px, 1fr) minmax(90px, auto) 64px 64px; align-items: center; gap: 8px;
+           padding: 6px 8px; border-bottom: 1px solid rgba(128, 128, 128, .12); }
+    .row:last-child { border-bottom: none; }
+    .row.bad { background: rgba(218, 54, 51, .07); }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #888; }
+    .dot.good { background: #2ea043; } .dot.bad { background: #da3633; } .dot.uncertain { background: #d29922; }
+    .cell { display: flex; justify-content: flex-end; min-width: 0; }
+    .name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .val { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .val.edit { cursor: pointer; border-bottom: 1px dashed rgba(128, 128, 128, .6); }
+    .type { font-size: 10px; opacity: .55; text-align: center; border: 1px solid rgba(128, 128, 128, .35); border-radius: 4px; padding: 1px 3px; }
+    .time { font-size: 11px; opacity: .55; text-align: right; font-variant-numeric: tabular-nums; }
+    .editor { display: flex; gap: 4px; justify-content: flex-end; }
+    .editor input { width: 90px; padding: 3px 6px; border-radius: 6px; border: 1px solid var(--accent-color, #1f8ad2); background: transparent; color: inherit; font: inherit; text-align: right; }
+    .editor button { border: none; border-radius: 6px; padding: 3px 8px; cursor: pointer; background: var(--accent-color, #1f8ad2); color: #fff; }
+    .editor button.x { background: rgba(128, 128, 128, .3); color: inherit; }
+    .sw { display: inline-block; position: relative; width: 38px; height: 22px; justify-self: end; cursor: pointer; }
+    .sw input { display: none; }
+    .sw span { position: absolute; inset: 0; border-radius: 22px; background: rgba(128, 128, 128, .45); transition: .2s; }
+    .sw span::after { content: ""; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: .2s; }
+    .sw input:checked + span { background: var(--accent-color, #1f8ad2); }
+    .sw input:checked + span::after { transform: translateX(16px); }
+    .badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; justify-self: end; }
+    .badge.on { background: rgba(46, 160, 67, .2); color: #2ea043; } .badge.offv { background: rgba(128, 128, 128, .2); }
+    .empty { text-align: center; opacity: .6; padding: 30px 10px; }
+    @media (max-width: 420px) { .row { grid-template-columns: 10px 1fr auto; } .type, .time { display: none; } }
+</style>
+<div class="wrap">
+    <div class="head">
+        <div class="title" id="title">OPC UA<small id="endpoint"></small></div>
+        <span class="meta" id="meta"></span>
+        <span class="pill wait" id="state">…</span>
+    </div>
+    <div class="err" id="err"></div>
+    <input class="search" id="search" type="search" placeholder="🔍 Variable suchen …">
+    <div class="list" id="list"></div>
+</div>
+<script>
+    let model = { rows: [] };
+    let editing = null;          // Ident, der gerade bearbeitet wird
+    const collapsed = new Set();
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const fmtTime = (t) => t ? new Date(t * 1000).toLocaleTimeString('de-AT') : '';
+
+    function handleMessage(data) {
+        try { model = typeof data === 'string' ? JSON.parse(data) : data; } catch (e) { return; }
+        render();
+    }
+
+    function render() {
+        const stateText = { ok: 'Verbunden', error: 'Fehler', off: 'Inaktiv', wait: 'Warte …' };
+        $('title').firstChild.nodeValue = model.name || 'OPC UA';
+        $('endpoint').textContent = model.endpoint || '';
+        $('state').className = 'pill ' + (model.state || 'wait');
+        $('state').textContent = stateText[model.state] || '…';
+        $('meta').textContent = model.updated ? fmtTime(model.updated) + ' · ' + model.cycle + ' ms' : '';
+        $('err').style.display = model.error ? 'block' : 'none';
+        $('err').textContent = model.error ? '⚠ ' + model.error : '';
+
+        const q = $('search').value.trim().toLowerCase();
+        const rows = (model.rows || []).filter((r) => !q || (r.n + ' ' + r.g + ' ' + r.id).toLowerCase().includes(q));
+        if (!rows.length) {
+            $('list').innerHTML = '<div class="empty">' + ((model.rows || []).length ? 'Keine Treffer' : 'Noch keine Variablen übernommen.<br>Instanz öffnen → „Server durchsuchen“') + '</div>';
+            return;
+        }
+        const groups = {};
+        rows.forEach((r) => (groups[r.g] = groups[r.g] || []).push(r));
+
+        // Beim Bearbeiten nur die übrigen Werte aktualisieren, damit das Eingabefeld erhalten bleibt
+        if (editing && document.querySelector('[data-row="' + editing + '"]')) {
+            rows.forEach((r) => { if (r.i !== editing) updateRow(r); });
+            return;
+        }
+        let html = '';
+        Object.keys(groups).sort((a, b) => a.localeCompare(b, 'de', { numeric: true })).forEach((g) => {
+            const list = groups[g];
+            const bad = list.filter((r) => r.s === 'bad').length;
+            html += '<div class="group' + (collapsed.has(g) ? ' collapsed' : '') + '" data-group="' + esc(g) + '">'
+                + '<div class="ghead" onclick="toggleGroup(this)"><span>' + esc(g) + '</span><span>' + list.length + (bad ? ' · ' + bad + ' Fehler' : '') + '</span></div><div class="rows">';
+            list.forEach((r) => { html += rowHtml(r); });
+            html += '</div></div>';
+        });
+        $('list').innerHTML = html;
+    }
+
+    function valueHtml(r) {
+        if (r.b === 1) {   // Boolean
+            if (r.w) {
+                return '<label class="sw" title="Schalten"><input type="checkbox" ' + (r.v ? 'checked' : '') + ' onchange="sendBool(\'' + r.i + '\', this)"><span></span></label>';
+            }
+            return '<span class="badge ' + (r.v ? 'on' : 'offv') + '">' + (r.v ? 'EIN' : 'AUS') + '</span>';
+        }
+        if (r.w) {
+            return '<div class="val edit" title="Klicken zum Ändern" onclick="startEdit(\'' + r.i + '\')">' + esc(r.f) + '</div>';
+        }
+        return '<div class="val" title="' + esc(r.f) + '">' + esc(r.f) + '</div>';
+    }
+
+    function rowHtml(r) {
+        return '<div class="row' + (r.s === 'bad' ? ' bad' : '') + '" data-row="' + r.i + '" title="' + esc(r.id) + '\nStatus: ' + esc(r.sn) + '">'
+            + '<span class="dot ' + r.s + '"></span>'
+            + '<span class="name">' + esc(r.n) + '</span>'
+            + '<span class="cell">' + valueHtml(r) + '</span>'
+            + '<span class="type">' + esc(r.ty) + '</span>'
+            + '<span class="time">' + fmtTime(r.t) + '</span></div>';
+    }
+
+    function updateRow(r) {
+        const el = document.querySelector('[data-row="' + r.i + '"]');
+        if (el) { el.outerHTML = rowHtml(r); }
+    }
+
+    function toggleGroup(el) {
+        const g = el.parentElement.dataset.group;
+        collapsed.has(g) ? collapsed.delete(g) : collapsed.add(g);
+        el.parentElement.classList.toggle('collapsed');
+    }
+
+    function sendBool(ident, el) { requestAction(ident, el.checked); }
+
+    function startEdit(ident) {
+        const r = model.rows.find((x) => x.i === ident);
+        const cell = document.querySelector('[data-row="' + ident + '"] .cell');
+        if (!r || !cell) return;
+        editing = ident;
+        const current = r.v !== null && r.v !== undefined ? r.v : '';
+        cell.innerHTML = '<div class="editor"><input id="ed" value="' + esc(current) + '" '
+            + (r.b === 12 ? '' : 'inputmode="decimal"') + '><button onclick="commitEdit()">✓</button><button class="x" onclick="cancelEdit()">✕</button></div>';
+        const input = $('ed');
+        input.focus(); input.select();
+        input.addEventListener('keydown', (e) => { if (e.key === 'Enter') commitEdit(); if (e.key === 'Escape') cancelEdit(); });
+    }
+
+    function commitEdit() {
+        const input = $('ed');
+        if (!input || !editing) return;
+        const r = model.rows.find((x) => x.i === editing);
+        let v = input.value;
+        if (r && r.b !== 12) { v = v.replace(',', '.'); }
+        requestAction(editing, v);
+        editing = null;
+        render();
+    }
+
+    function cancelEdit() { editing = null; render(); }
+
+    $('search').addEventListener('input', () => { editing = null; render(); });
+</script>

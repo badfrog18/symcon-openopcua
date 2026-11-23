@@ -1,0 +1,374 @@
+<?php
+
+declare(strict_types=1);
+
+namespace PhpOpcua\Client\Client;
+
+use PhpOpcua\Client\Encoding\BinaryDecoder;
+use PhpOpcua\Client\Encoding\BinaryEncoder;
+use PhpOpcua\Client\Event\SecureChannelClosed;
+use PhpOpcua\Client\Event\SecureChannelOpened;
+use PhpOpcua\Client\Event\SecureChannelRenewed;
+use PhpOpcua\Client\Exception\ConfigurationException;
+use PhpOpcua\Client\Exception\MessageTypeException;
+use PhpOpcua\Client\Exception\ProtocolException;
+use PhpOpcua\Client\Protocol\MessageHeader;
+use PhpOpcua\Client\Protocol\SecureChannelRequest;
+use PhpOpcua\Client\Protocol\SecureChannelResponse;
+use PhpOpcua\Client\Protocol\ServiceTypeId;
+use PhpOpcua\Client\Protocol\SessionService;
+use PhpOpcua\Client\Security\CertificateManager;
+use PhpOpcua\Client\Security\SecureChannel;
+use PhpOpcua\Client\Security\SecurityMode;
+use PhpOpcua\Client\Security\SecurityPolicy;
+use PhpOpcua\Client\Types\NodeId;
+
+/**
+ * Provides secure channel opening and closing for the connected client.
+ */
+trait ManagesSecureChannelTrait
+{
+    /**
+     * Open a secure channel with or without message-level security.
+     *
+     * @return void
+     *
+     * @throws ProtocolException If the server responds with an unexpected message type.
+     * @throws ConfigurationException If the client certificate cannot be loaded.
+     */
+    private function openSecureChannel(): void
+    {
+        $isSecure = $this->securityPolicy !== SecurityPolicy::None
+            && $this->securityMode !== SecurityMode::None;
+
+        if ($this->transport->isSecureChannelExternal()) {
+            // TLS (or equivalent lower-layer transport security) is already
+            // the secure channel — skip the UA OpenSecureChannel exchange.
+            $this->openSecureChannelExternal();
+        } elseif ($isSecure) {
+            $this->openSecureChannelWithSecurity();
+        } else {
+            $this->openSecureChannelNoSecurity();
+        }
+
+        $this->dispatch(fn () => new SecureChannelOpened($this, $this->secureChannelId, $this->securityPolicy, $this->securityMode));
+    }
+
+    /**
+     * Initialise the SessionService when the transport already supplies a
+     * confidential channel (e.g. HTTPS / TLS). No OPN frame goes on the wire;
+     * we pin synthetic `secureChannelId` and `tokenId` so the rest of the
+     * client pipeline (CreateSession, ActivateSession, …) frames messages
+     * consistently.
+     */
+    private function openSecureChannelExternal(): void
+    {
+        $this->secureChannel = new SecureChannel(SecurityPolicy::None, SecurityMode::None);
+        $this->secureChannelId = 1;
+        $this->secureChannelRenewAt = null;
+
+        $this->session = new SessionService($this->secureChannelId, 1);
+        $this->session->setUserTokenPolicyIds(
+            $this->usernamePolicyId,
+            $this->certificatePolicyId,
+            $this->anonymousPolicyId,
+            $this->usernameTokenSecurityPolicyUri,
+        );
+        $this->session->setUserTokenEncryptionContext(
+            $this->serverCertDer,
+            $this->secureChannel->getMessageSecurity(),
+        );
+
+        $this->initServices($this->session);
+
+        $this->logger->debug('SecureChannel skipped — transport provides external security (e.g. TLS)', $this->logContext());
+    }
+
+    /**
+     * Open a secure channel without message-level security.
+     *
+     * @return void
+     *
+     * @throws ProtocolException If the server responds with an unexpected message type.
+     */
+    private function openSecureChannelNoSecurity(): void
+    {
+        $this->secureChannel = new SecureChannel(
+            SecurityPolicy::None,
+            SecurityMode::None,
+        );
+
+        $request = new SecureChannelRequest();
+        $this->logger->debug('OpenSecureChannel request (no security)', $this->logContext());
+        $this->transport->send($request->encode());
+
+        $response = $this->transport->receive();
+        $decoder = new BinaryDecoder($response);
+        $header = MessageHeader::decode($decoder);
+
+        if ($header->getMessageType() !== 'OPN') {
+            throw new MessageTypeException('OPN', $header->getMessageType());
+        }
+
+        $decoder->readUInt32();
+
+        $scResponse = SecureChannelResponse::decode($decoder);
+        $this->secureChannelId = $scResponse->getSecureChannelId();
+        $this->logger->debug('OpenSecureChannel response: channelId={channelId}', $this->logContext(['channelId' => $this->secureChannelId]));
+
+        $this->session = new SessionService($this->secureChannelId, $scResponse->getTokenId());
+        $this->session->setUserTokenPolicyIds(
+            $this->usernamePolicyId,
+            $this->certificatePolicyId,
+            $this->anonymousPolicyId,
+            $this->usernameTokenSecurityPolicyUri,
+        );
+        $this->session->setUserTokenEncryptionContext(
+            $this->serverCertDer,
+            $this->secureChannel->getMessageSecurity(),
+        );
+
+        $this->initServices($this->session);
+        $this->scheduleSecureChannelRenewal($scResponse->getRevisedLifetime());
+    }
+
+    /**
+     * Open a secure channel with message-level security.
+     *
+     * @return void
+     *
+     * @throws ConfigurationException If the client certificate cannot be loaded.
+     * @throws ProtocolException If the secure channel negotiation fails.
+     */
+    private function openSecureChannelWithSecurity(): void
+    {
+        [$clientCertDer, $clientPrivateKey] = $this->loadClientCertificateAndKey();
+        $clientCertChainDer = $this->buildCertificateChain($clientCertDer);
+
+        $this->secureChannel = new SecureChannel(
+            $this->securityPolicy,
+            $this->securityMode,
+            $clientCertDer,
+            $clientPrivateKey,
+            $this->serverCertDer,
+            $clientCertChainDer,
+        );
+
+        $opnMessage = $this->secureChannel->createOpenSecureChannelMessage();
+        $this->logger->debug('OpenSecureChannel request (policy={policy}, mode={mode})', $this->logContext([
+            'policy' => $this->securityPolicy->name,
+            'mode' => $this->securityMode->name,
+        ]));
+        $this->transport->send($opnMessage);
+
+        $response = $this->transport->receive();
+        $result = $this->secureChannel->processOpenSecureChannelResponse($response);
+
+        $this->secureChannelId = $result['secureChannelId'];
+        $this->logger->debug('OpenSecureChannel response: channelId={channelId}', $this->logContext(['channelId' => $this->secureChannelId]));
+        $this->serverNonce = $result['serverNonce'];
+
+        $this->session = new SessionService(
+            $this->secureChannelId,
+            $result['tokenId'],
+            $this->secureChannel,
+        );
+        $this->session->setUserTokenPolicyIds(
+            $this->usernamePolicyId,
+            $this->certificatePolicyId,
+            $this->anonymousPolicyId,
+            $this->usernameTokenSecurityPolicyUri,
+        );
+        $this->session->setUserTokenEncryptionContext(
+            $this->serverCertDer,
+            $this->secureChannel->getMessageSecurity(),
+        );
+
+        $this->initServices($this->session);
+        $this->scheduleSecureChannelRenewal($result['revisedLifetime']);
+    }
+
+    /**
+     * Renew the security token of the open secure channel.
+     *
+     * @return void
+     *
+     * @throws ProtocolException If the server responds with an unexpected message type.
+     */
+    private function renewSecureChannel(): void
+    {
+        $session = $this->requireSession();
+
+        if ($this->secureChannel !== null && $this->secureChannel->isSecurityActive()) {
+            $this->transport->send($this->secureChannel->createOpenSecureChannelMessage(true));
+            $result = $this->secureChannel->processOpenSecureChannelResponse($this->transport->receive());
+            $tokenId = $result['tokenId'];
+            $revisedLifetime = $result['revisedLifetime'];
+        } else {
+            $request = new SecureChannelRequest();
+            $this->transport->send($request->encode($this->secureChannelId, SecureChannelRequest::REQUEST_TYPE_RENEW, $session->getNextSequenceNumber()));
+
+            $decoder = new BinaryDecoder($this->transport->receive());
+            $header = MessageHeader::decode($decoder);
+            if ($header->getMessageType() !== 'OPN') {
+                throw new MessageTypeException('OPN', $header->getMessageType());
+            }
+            $decoder->readUInt32();
+
+            $scResponse = SecureChannelResponse::decode($decoder);
+            $tokenId = $scResponse->getTokenId();
+            $revisedLifetime = $scResponse->getRevisedLifetime();
+            $session->setTokenId($tokenId);
+        }
+
+        $this->scheduleSecureChannelRenewal($revisedLifetime);
+        $this->logger->debug('Secure channel token renewed (channelId={channelId}, tokenId={tokenId}, lifetime={lifetime}ms)', $this->logContext([
+            'channelId' => $this->secureChannelId,
+            'tokenId' => $tokenId,
+            'lifetime' => $revisedLifetime,
+        ]));
+        $this->dispatch(fn () => new SecureChannelRenewed($this, $this->secureChannelId, $tokenId, $revisedLifetime));
+    }
+
+    /**
+     * @param int $revisedLifetime Token lifetime granted by the server, in milliseconds.
+     * @return void
+     */
+    private function scheduleSecureChannelRenewal(int $revisedLifetime): void
+    {
+        $this->secureChannelRenewAt = $revisedLifetime > 0 ? microtime(true) + $revisedLifetime * 0.75 / 1000 : null;
+    }
+
+    /**
+     * Load the client certificate and private key for secure channel setup.
+     *
+     * @return array{0: ?string, 1: ?\OpenSSLAsymmetricKey}
+     *
+     * @throws ConfigurationException If the certificate file cannot be read.
+     */
+    private function loadClientCertificateAndKey(): array
+    {
+        $certManager = new CertificateManager();
+
+        if ($this->clientCertPath !== null && $this->clientKeyPath !== null) {
+            $certContent = file_get_contents($this->clientCertPath);
+            if ($certContent === false) {
+                throw new ConfigurationException("Failed to read client certificate: {$this->clientCertPath}");
+            }
+
+            $clientCertDer = str_contains($certContent, '-----BEGIN')
+                ? $certManager->loadCertificatePem($this->clientCertPath)
+                : $certManager->loadCertificateDer($this->clientCertPath);
+
+            return [$clientCertDer, $certManager->loadPrivateKeyPem($this->clientKeyPath)];
+        }
+
+        $eccCurve = $this->securityPolicy->isEcc() ? $this->securityPolicy->getEcdhCurveName() : null;
+        $generated = $certManager->generateSelfSignedCertificate('urn:opcua-client', $eccCurve);
+
+        return [$generated['certDer'], $generated['privateKey']];
+    }
+
+    /**
+     * Build a certificate chain by appending the CA certificate if configured.
+     *
+     * @param ?string $clientCertDer The client certificate in DER format.
+     * @return ?string The certificate chain, or the original certificate if no CA is configured.
+     */
+    private function buildCertificateChain(?string $clientCertDer): ?string
+    {
+        if ($clientCertDer === null || $this->caCertPath === null) {
+            return $clientCertDer;
+        }
+
+        $caCertContent = file_get_contents($this->caCertPath);
+        if ($caCertContent === false) {
+            return $clientCertDer;
+        }
+
+        $certManager = new CertificateManager();
+        $caCertDer = str_contains($caCertContent, '-----BEGIN')
+            ? $certManager->loadCertificatePem($this->caCertPath)
+            : $certManager->loadCertificateDer($this->caCertPath);
+
+        return $clientCertDer . $caCertDer;
+    }
+
+    /**
+     * Close the secure channel.
+     *
+     * @return void
+     */
+    private function closeSecureChannel(): void
+    {
+        $this->logger->debug('CloseSecureChannel request (channelId={channelId})', $this->logContext(['channelId' => $this->secureChannelId]));
+        $this->dispatch(fn () => new SecureChannelClosed($this, $this->secureChannelId));
+
+        if ($this->transport->isSecureChannelExternal()) {
+            return;
+        }
+
+        if ($this->secureChannel !== null && $this->secureChannel->isSecurityActive()) {
+            $this->closeSecureChannelSecure($this->secureChannel);
+
+            return;
+        }
+
+        $body = new BinaryEncoder();
+        $body->writeUInt32($this->session?->getTokenId() ?? 0);
+        $body->writeUInt32($this->session?->getNextSequenceNumber() ?? 1);
+        $body->writeUInt32($this->nextRequestId());
+
+        $bodyBytes = $body->getBuffer();
+        $totalSize = MessageHeader::HEADER_SIZE + 4 + strlen($bodyBytes);
+
+        $encoder = new BinaryEncoder();
+        $header = new MessageHeader('CLO', 'F', $totalSize);
+        $header->encode($encoder);
+        $encoder->writeUInt32($this->secureChannelId);
+        $encoder->writeRawBytes($bodyBytes);
+
+        $this->transport->send($encoder->getBuffer());
+    }
+
+    /**
+     * Close the secure channel when message-level security is active.
+     *
+     * @param SecureChannel $secureChannel The active secure channel.
+     * @return void
+     */
+    private function closeSecureChannelSecure(SecureChannel $secureChannel): void
+    {
+        $requestId = $this->nextRequestId();
+
+        $innerBody = new BinaryEncoder();
+        $innerBody->writeNodeId(NodeId::numeric(0, ServiceTypeId::CLOSE_SECURE_CHANNEL_REQUEST));
+
+        $innerBody->writeNodeId(NodeId::numeric(0, ServiceTypeId::NULL));
+        $innerBody->writeDateTime(new \DateTimeImmutable());
+        $innerBody->writeUInt32($requestId);
+        $innerBody->writeUInt32(0);
+        $innerBody->writeString(null);
+        $innerBody->writeUInt32(10000);
+        $innerBody->writeNodeId(NodeId::numeric(0, ServiceTypeId::NULL));
+        $innerBody->writeByte(0);
+
+        $message = $secureChannel->buildMessage($innerBody->getBuffer(), 'CLO');
+        $this->transport->send($message);
+    }
+
+    /**
+     * Initialize services from a session by booting all registered modules.
+     *
+     * @param SessionService $session The session service to derive services from.
+     * @return void
+     */
+    private function initServices(SessionService $session): void
+    {
+        $this->session = $session;
+
+        if (isset($this->moduleRegistry)) {
+            $this->moduleRegistry->bootAll($this, $this, $session);
+        }
+    }
+}

@@ -1,0 +1,12 @@
+{
+    "id": "{E2977B35-D52C-4AB0-BF54-D5A40031D199}",
+    "author": "Manuel Bruckmoser",
+    "name": "OpenOPCUA",
+    "url": "https://github.com/badfrog18/symcon-openopcua",
+    "compatibility": {
+        "version": "7.1"
+    },
+    "version": "1.0",
+    "build": 1,
+    "date": 1795392000
+}

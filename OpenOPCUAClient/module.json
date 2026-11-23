@@ -1,0 +1,15 @@
+{
+    "id": "{77B8E98F-60CA-4265-8724-E3AA6DEECA6E}",
+    "name": "OpenOPCUA Client",
+    "type": 3,
+    "vendor": "",
+    "aliases": [
+        "OPC UA Client (Open Source)",
+        "S7 OPC UA Client"
+    ],
+    "parentRequirements": [],
+    "childRequirements": [],
+    "implemented": [],
+    "prefix": "OOPCUA",
+    "url": "https://github.com/badfrog18/symcon-openopcua"
+}

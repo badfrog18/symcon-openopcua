@@ -1,0 +1,439 @@
+<?php
+
+declare(strict_types=1);
+
+namespace PhpOpcua\Client\Encoding;
+
+use DateTimeImmutable;
+use PhpOpcua\Client\Exception\EncodingException;
+use PhpOpcua\Client\Types\BuiltinType;
+use PhpOpcua\Client\Types\DataValue;
+use PhpOpcua\Client\Types\ExtensionObject;
+use PhpOpcua\Client\Types\LocalizedText;
+use PhpOpcua\Client\Types\NodeId;
+use PhpOpcua\Client\Types\QualifiedName;
+use PhpOpcua\Client\Types\Variant;
+
+/**
+ * OPC UA binary protocol serializer. Writes typed values to a byte buffer.
+ */
+class BinaryEncoder
+{
+    private string $buffer = '';
+
+    /**
+     * Return the encoded byte buffer.
+     */
+    public function getBuffer(): string
+    {
+        return $this->buffer;
+    }
+
+    /**
+     * Return the current buffer size in bytes.
+     */
+    public function getSize(): int
+    {
+        return strlen($this->buffer);
+    }
+
+    /**
+     * Reset the buffer to empty.
+     */
+    public function reset(): void
+    {
+        $this->buffer = '';
+    }
+
+    /**
+     * @param bool $value
+     */
+    public function writeBoolean(bool $value): void
+    {
+        $this->buffer .= pack('C', $value ? 1 : 0);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeByte(int $value): void
+    {
+        $this->buffer .= pack('C', $value);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeSByte(int $value): void
+    {
+        $this->buffer .= pack('c', $value);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeUInt16(int $value): void
+    {
+        $this->buffer .= pack('v', $value);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeInt16(int $value): void
+    {
+        $this->buffer .= pack('v', $value & 0xFFFF);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeUInt32(int $value): void
+    {
+        $this->buffer .= pack('V', $value);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeInt32(int $value): void
+    {
+        $this->buffer .= pack('V', $value & 0xFFFFFFFF);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeInt64(int $value): void
+    {
+        $this->buffer .= pack('P', $value);
+    }
+
+    /**
+     * @param int $value
+     */
+    public function writeUInt64(int $value): void
+    {
+        $this->buffer .= pack('P', $value);
+    }
+
+    /**
+     * @param float $value
+     */
+    public function writeFloat(float $value): void
+    {
+        $this->buffer .= pack('g', $value);
+    }
+
+    /**
+     * @param float $value
+     */
+    public function writeDouble(float $value): void
+    {
+        $this->buffer .= pack('e', $value);
+    }
+
+    /**
+     * @param ?string $value
+     */
+    public function writeString(?string $value): void
+    {
+        if ($value === null) {
+            $this->writeInt32(-1);
+
+            return;
+        }
+        $this->writeInt32(strlen($value));
+        $this->buffer .= $value;
+    }
+
+    /**
+     * @param ?string $value
+     */
+    public function writeByteString(?string $value): void
+    {
+        $this->writeString($value);
+    }
+
+    /**
+     * @param ?DateTimeImmutable $value
+     */
+    public function writeDateTime(?DateTimeImmutable $value): void
+    {
+        if ($value === null) {
+            $this->writeInt64(0);
+
+            return;
+        }
+
+        $unixTimestamp = (float) $value->format('U.u');
+        $epochOffset = 11644473600;
+        $opcuaTimestamp = (int) (($unixTimestamp + $epochOffset) * 10_000_000);
+        $this->writeInt64($opcuaTimestamp);
+    }
+
+    /**
+     * @param string $guid
+     */
+    public function writeGuid(string $guid): void
+    {
+        $parts = explode('-', $guid);
+        if (count($parts) !== 5) {
+            throw new EncodingException("Invalid GUID format: {$guid}");
+        }
+
+        $this->writeUInt32((int) hexdec($parts[0]));
+        $this->writeUInt16((int) hexdec($parts[1]));
+        $this->writeUInt16((int) hexdec($parts[2]));
+
+        $tail = hex2bin($parts[3] . $parts[4]);
+        if ($tail === false) {
+            throw new EncodingException("Invalid GUID format: {$guid}");
+        }
+        $this->writeRawBytes($tail);
+    }
+
+    /**
+     * @param NodeId $nodeId
+     */
+    public function writeNodeId(NodeId $nodeId): void
+    {
+        $encodingByte = $nodeId->getEncodingByte();
+        $identifier = $nodeId->getIdentifier();
+
+        switch ($encodingByte) {
+            case 0x00:
+                $this->writeByte(0x00);
+                $this->writeByte((int) $identifier);
+                break;
+            case 0x01:
+                $this->writeByte(0x01);
+                $this->writeByte($nodeId->getNamespaceIndex());
+                $this->writeUInt16((int) $identifier);
+                break;
+            case 0x02:
+                $this->writeByte(0x02);
+                $this->writeUInt16($nodeId->getNamespaceIndex());
+                $this->writeUInt32((int) $identifier);
+                break;
+            case 0x03:
+                $this->writeByte(0x03);
+                $this->writeUInt16($nodeId->getNamespaceIndex());
+                $this->writeString((string) $identifier);
+                break;
+            case 0x04:
+                $this->writeByte(0x04);
+                $this->writeUInt16($nodeId->getNamespaceIndex());
+                $this->writeGuid((string) $identifier);
+                break;
+            case 0x05:
+                $this->writeByte(0x05);
+                $this->writeUInt16($nodeId->getNamespaceIndex());
+                $opaque = hex2bin((string) $identifier);
+                if ($opaque === false) {
+                    throw new EncodingException("Invalid opaque NodeId identifier: {$identifier}");
+                }
+                $this->writeByteString($opaque);
+                break;
+            default:
+                throw new EncodingException("Unsupported NodeId encoding byte: {$encodingByte}");
+        }
+    }
+
+    /**
+     * @param NodeId $nodeId
+     */
+    public function writeExpandedNodeId(NodeId $nodeId): void
+    {
+        $this->writeNodeId($nodeId);
+    }
+
+    /**
+     * @param QualifiedName $name
+     */
+    public function writeQualifiedName(QualifiedName $name): void
+    {
+        $this->writeUInt16($name->getNamespaceIndex());
+        $this->writeString($name->getName());
+    }
+
+    /**
+     * @param LocalizedText $text
+     */
+    public function writeLocalizedText(LocalizedText $text): void
+    {
+        $mask = $text->getEncodingMask();
+        $this->writeByte($mask);
+        if ($mask & 0x01) {
+            $this->writeString($text->getLocale());
+        }
+        if ($mask & 0x02) {
+            $this->writeString($text->getText());
+        }
+    }
+
+    /**
+     * @param Variant $variant
+     */
+    public function writeVariant(Variant $variant): void
+    {
+        $type = $variant->getType();
+        $value = $variant->getValue();
+
+        if (is_array($value)) {
+            $dimensions = $variant->getDimensions();
+            $encodingByte = $type->value | 0x80;
+            if ($dimensions !== null) {
+                $encodingByte |= 0x40;
+            }
+            $this->writeByte($encodingByte);
+            $this->writeInt32(count($value));
+            foreach ($value as $item) {
+                $this->writeVariantValue($type, $item);
+            }
+            if ($dimensions !== null) {
+                $this->writeInt32(count($dimensions));
+                foreach ($dimensions as $dim) {
+                    $this->writeInt32($dim);
+                }
+            }
+        } else {
+            $this->writeByte($type->value);
+            $this->writeVariantValue($type, $value);
+        }
+    }
+
+    /**
+     * @param BuiltinType $type
+     * @param mixed $value
+     */
+    public function writeVariantValue(BuiltinType $type, mixed $value): void
+    {
+        match ($type) {
+            BuiltinType::Boolean => $this->writeBoolean((bool) self::toScalar($type, $value)),
+            BuiltinType::SByte => $this->writeSByte((int) self::toScalar($type, $value)),
+            BuiltinType::Byte => $this->writeByte((int) self::toScalar($type, $value)),
+            BuiltinType::Int16 => $this->writeInt16((int) self::toScalar($type, $value)),
+            BuiltinType::UInt16 => $this->writeUInt16((int) self::toScalar($type, $value)),
+            BuiltinType::Int32 => $this->writeInt32((int) self::toScalar($type, $value)),
+            BuiltinType::UInt32 => $this->writeUInt32((int) self::toScalar($type, $value)),
+            BuiltinType::Int64 => $this->writeInt64((int) self::toScalar($type, $value)),
+            BuiltinType::UInt64 => $this->writeUInt64((int) self::toScalar($type, $value)),
+            BuiltinType::Float => $this->writeFloat((float) self::toScalar($type, $value)),
+            BuiltinType::Double => $this->writeDouble((float) self::toScalar($type, $value)),
+            BuiltinType::String => $this->writeString(self::toNullableString($type, $value)),
+            BuiltinType::DateTime => $this->writeDateTime(self::toInstanceOrNull($type, $value, DateTimeImmutable::class)),
+            BuiltinType::Guid => $this->writeGuid((string) self::toScalar($type, $value)),
+            BuiltinType::ByteString => $this->writeByteString(self::toNullableString($type, $value)),
+            BuiltinType::XmlElement => $this->writeString(self::toNullableString($type, $value)),
+            BuiltinType::NodeId => $this->writeNodeId(self::toInstance($type, $value, NodeId::class)),
+            BuiltinType::ExpandedNodeId => $this->writeExpandedNodeId(self::toInstance($type, $value, NodeId::class)),
+            BuiltinType::StatusCode => $this->writeUInt32((int) self::toScalar($type, $value)),
+            BuiltinType::QualifiedName => $this->writeQualifiedName(self::toInstance($type, $value, QualifiedName::class)),
+            BuiltinType::LocalizedText => $this->writeLocalizedText(self::toInstance($type, $value, LocalizedText::class)),
+            BuiltinType::ExtensionObject => $this->writeExtensionObject(self::toInstance($type, $value, ExtensionObject::class)),
+            BuiltinType::DataValue => $this->writeDataValue(self::toInstance($type, $value, DataValue::class)),
+            BuiltinType::Variant => $this->writeVariant(self::toInstance($type, $value, Variant::class)),
+            BuiltinType::DiagnosticInfo => throw new EncodingException('DiagnosticInfo encoding not supported'),
+        };
+    }
+
+    private static function variantTypeMismatch(BuiltinType $type, string $expected, mixed $value): EncodingException
+    {
+        return new EncodingException("Variant value for {$type->name} must be {$expected}, " . get_debug_type($value) . ' given');
+    }
+
+    /**
+     * Validate that a variant value is a scalar before casting it to the wire type.
+     */
+    private static function toScalar(BuiltinType $type, mixed $value): bool|int|float|string
+    {
+        if (! is_scalar($value)) {
+            throw self::variantTypeMismatch($type, 'a scalar', $value);
+        }
+
+        return $value;
+    }
+
+    private static function toNullableString(BuiltinType $type, mixed $value): ?string
+    {
+        if ($value !== null && ! is_string($value)) {
+            throw self::variantTypeMismatch($type, 'a string or null', $value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * @template T of object
+     * @param class-string<T> $class
+     * @return T
+     */
+    private static function toInstance(BuiltinType $type, mixed $value, string $class): object
+    {
+        if (! $value instanceof $class) {
+            throw self::variantTypeMismatch($type, "a {$class} instance", $value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * @template T of object
+     * @param class-string<T> $class
+     * @return ?T
+     */
+    private static function toInstanceOrNull(BuiltinType $type, mixed $value, string $class): ?object
+    {
+        if ($value !== null && ! $value instanceof $class) {
+            throw self::variantTypeMismatch($type, "a {$class} instance or null", $value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * @param ExtensionObject $value
+     */
+    public function writeExtensionObject(ExtensionObject $value): void
+    {
+        $this->writeNodeId($value->typeId);
+        $this->writeByte($value->encoding);
+        if ($value->encoding === 0x01) {
+            $this->writeByteString($value->body);
+        } elseif ($value->encoding === 0x02) {
+            $this->writeString($value->body);
+        }
+    }
+
+    /**
+     * @param DataValue $dv
+     */
+    public function writeDataValue(DataValue $dv): void
+    {
+        $mask = $dv->getEncodingMask();
+        $this->writeByte($mask);
+
+        $variant = $dv->getVariant();
+        if (($mask & 0x01) !== 0 && $variant !== null) {
+            $this->writeVariant($variant);
+        }
+        if ($mask & 0x02) {
+            $this->writeUInt32($dv->getStatusCode());
+        }
+        if ($mask & 0x04) {
+            $this->writeDateTime($dv->getSourceTimestamp());
+        }
+        if ($mask & 0x08) {
+            $this->writeDateTime($dv->getServerTimestamp());
+        }
+    }
+
+    /**
+     * @param string $bytes
+     */
+    public function writeRawBytes(string $bytes): void
+    {
+        $this->buffer .= $bytes;
+    }
+}

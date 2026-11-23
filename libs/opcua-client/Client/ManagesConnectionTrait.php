@@ -1,0 +1,352 @@
+<?php
+
+declare(strict_types=1);
+
+namespace PhpOpcua\Client\Client;
+
+use Closure;
+use PhpOpcua\Client\Event\ClientConnected;
+use PhpOpcua\Client\Event\ClientConnecting;
+use PhpOpcua\Client\Event\ClientDisconnected;
+use PhpOpcua\Client\Event\ClientDisconnecting;
+use PhpOpcua\Client\Event\ClientReconnecting;
+use PhpOpcua\Client\Event\ConnectionFailed;
+use PhpOpcua\Client\Event\RetryAttempt;
+use PhpOpcua\Client\Event\RetryExhausted;
+use PhpOpcua\Client\Exception\ConfigurationException;
+use PhpOpcua\Client\Exception\ConnectionException;
+use PhpOpcua\Client\Exception\OpcUaException;
+use PhpOpcua\Client\Exception\ServiceException;
+use PhpOpcua\Client\Exception\UntrustedCertificateException;
+use PhpOpcua\Client\Security\CertificateManager;
+use PhpOpcua\Client\Security\SecurityMode;
+use PhpOpcua\Client\Security\SecurityPolicy;
+use PhpOpcua\Client\Types\ConnectionState;
+use PhpOpcua\Client\Types\SessionState;
+use PhpOpcua\Client\Types\StatusCode;
+
+/**
+ * Provides connection lifecycle management including connect, reconnect, disconnect, and automatic retry logic.
+ */
+trait ManagesConnectionTrait
+{
+    /**
+     * Reconnect to the previously connected endpoint.
+     *
+     * @return void
+     *
+     * @throws ConnectionException If the reconnection attempt fails.
+     *
+     * @see self::disconnect()
+     */
+    public function reconnect(): void
+    {
+        $this->reconnectWithSession($this->reactivateSession);
+    }
+
+    /**
+     * @param bool $reactivateSession Reactivate the current session on the new secure channel instead of creating a new one.
+     * @return void
+     *
+     * @throws ConnectionException If the reconnection attempt fails.
+     */
+    private function reconnectWithSession(bool $reactivateSession): void
+    {
+        $endpointUrl = $this->lastEndpointUrl;
+        if ($endpointUrl === null) {
+            throw new ConnectionException('Cannot reconnect: no previous connection');
+        }
+
+        $state = $reactivateSession ? ($this->getSessionState() ?? $this->pendingSessionState) : null;
+
+        $this->dispatch(fn () => new ClientReconnecting($this, $endpointUrl));
+        $this->logger->info('Reconnecting to {endpoint}', $this->logContext(['endpoint' => $endpointUrl]));
+        $this->transport->close();
+        $this->resetConnectionState();
+        $this->pendingSessionState = $state;
+
+        $this->performConnect($endpointUrl);
+    }
+
+    /**
+     * Close the secure channel and the socket without closing the session, so it can be resumed.
+     *
+     * @return ?SessionState The session to pass to {@see \PhpOpcua\Client\ClientBuilder::resumeSession()}, or null when there is none.
+     */
+    public function suspend(): ?SessionState
+    {
+        $state = $this->getSessionState();
+        $this->logger->info('Suspending session', $this->logContext());
+
+        if ($this->secureChannelId !== 0) {
+            try {
+                $this->closeSecureChannel();
+            } catch (OpcUaException) {
+            }
+        }
+
+        $this->transport->close();
+        $this->resetConnectionState();
+        $this->pendingSessionState = null;
+        $this->lastEndpointUrl = null;
+        $this->connectionState = ConnectionState::Disconnected;
+        $this->dispatch(fn () => new ClientDisconnected($this));
+
+        return $state;
+    }
+
+    /**
+     * Gracefully disconnect from the server, closing the session and secure channel.
+     *
+     * @return void
+     */
+    public function disconnect(): void
+    {
+        $this->dispatch(fn () => new ClientDisconnecting($this, $this->lastEndpointUrl));
+        $this->logger->info('Disconnecting', $this->logContext());
+        if ($this->session !== null && $this->authenticationToken !== null) {
+            try {
+                $this->closeSession();
+            } catch (OpcUaException) {
+            }
+        }
+
+        if ($this->secureChannelId !== 0) {
+            try {
+                $this->closeSecureChannel();
+            } catch (OpcUaException) {
+            }
+        }
+
+        $this->transport->close();
+
+        $this->resetConnectionState();
+        $this->lastEndpointUrl = null;
+        $this->connectionState = ConnectionState::Disconnected;
+        $this->dispatch(fn () => new ClientDisconnected($this));
+    }
+
+    /**
+     * Check whether the client is currently connected.
+     *
+     * @return bool True if the connection state is Connected, false otherwise.
+     */
+    public function isConnected(): bool
+    {
+        return $this->connectionState === ConnectionState::Connected;
+    }
+
+    /**
+     * Get the current connection state.
+     *
+     * @return ConnectionState
+     *
+     * @see ConnectionState
+     */
+    public function getConnectionState(): ConnectionState
+    {
+        return $this->connectionState;
+    }
+
+    /**
+     * Ensure the client is in a connected state.
+     *
+     * @return void
+     *
+     * @throws ConnectionException If the client is not connected.
+     */
+    public function ensureConnected(): void
+    {
+        if ($this->connectionState === ConnectionState::Connected) {
+            if ($this->renewSecurityToken && $this->secureChannelRenewAt !== null && microtime(true) >= $this->secureChannelRenewAt) {
+                $this->renewSecureChannel();
+            }
+
+            return;
+        }
+
+        throw match ($this->connectionState) {
+            ConnectionState::Disconnected => new ConnectionException('Not connected: call connect() first'),
+            ConnectionState::Broken => new ConnectionException('Connection lost: call reconnect() or connect() to re-establish'),
+        };
+    }
+
+    /**
+     * Execute an operation with automatic retry on connection failure.
+     *
+     * @template T
+     * @param Closure(): T $operation The operation to execute.
+     * @return T
+     *
+     * @throws ConnectionException If all retry attempts are exhausted.
+     * @throws ServiceException If the operation fails with a service error that is not an expired session.
+     */
+    public function executeWithRetry(Closure $operation): mixed
+    {
+        $maxRetries = $this->autoRetry ?? 0;
+        $sessionRecreated = false;
+
+        for ($attempt = 0; ; $attempt++) {
+            try {
+                return $operation();
+            } catch (ConnectionException $e) {
+                $this->connectionState = ConnectionState::Broken;
+
+                if ($attempt >= $maxRetries || $this->lastEndpointUrl === null) {
+                    $this->dispatch(fn () => new RetryExhausted($this, $attempt + 1, $e));
+                    $this->logger->error('Operation failed after {attempts} attempt(s): {message}', $this->logContext([
+                        'attempts' => $attempt + 1,
+                        'message' => $e->getMessage(),
+                    ]));
+                    throw $e;
+                }
+
+                $this->dispatch(fn () => new RetryAttempt($this, $attempt + 1, $maxRetries, $e));
+                $this->logger->warning('Connection lost, retrying ({attempt}/{max})', $this->logContext([
+                    'attempt' => $attempt + 1,
+                    'max' => $maxRetries,
+                ]));
+                $this->reconnect();
+            } catch (ServiceException $e) {
+                if (! $this->recreateExpiredSession
+                    || $sessionRecreated
+                    || $this->lastEndpointUrl === null
+                    || ! in_array($e->getStatusCode(), [StatusCode::BadSessionIdInvalid, 0x80260000, 0x80270000], true)) {
+                    throw $e;
+                }
+
+                $sessionRecreated = true;
+                $this->logger->warning('Session no longer valid ({status}), recreating it', $this->logContext([
+                    'status' => StatusCode::getName($e->getStatusCode()),
+                ]));
+                $this->reconnectWithSession(false);
+            }
+        }
+    }
+
+    /**
+     * Perform the TCP connection, handshake, secure channel, and session establishment.
+     *
+     * @param string $endpointUrl The OPC UA endpoint URL.
+     * @return void
+     *
+     * @throws ConfigurationException If the endpoint URL is invalid.
+     * @throws ConnectionException If the TCP connection or handshake fails.
+     */
+    private function performConnect(string $endpointUrl): void
+    {
+        $parsed = parse_url($endpointUrl);
+        if ($parsed === false || ! isset($parsed['host'])) {
+            throw new ConfigurationException("Invalid endpoint URL: {$endpointUrl}");
+        }
+
+        $host = $parsed['host'];
+        $port = $parsed['port'] ?? 4840;
+
+        $isSecure = $this->securityPolicy !== SecurityPolicy::None
+            && $this->securityMode !== SecurityMode::None;
+
+        $needCert = $isSecure && $this->serverCertDer === null;
+        $needAnonymousPolicyId = $this->anonymousPolicyId === null;
+        $needUsernamePolicyId = $this->usernamePolicyId === null;
+        $needCertificatePolicyId = $this->certificatePolicyId === null;
+
+        if ($needCert
+            || $needAnonymousPolicyId
+            || $needUsernamePolicyId
+            || $needCertificatePolicyId
+        ) {
+            $this->discoverServerCertificate($host, $port, $endpointUrl, $isSecure);
+        }
+
+        if ($isSecure) {
+            $this->validateServerCertificate();
+            $this->validateServerApplicationUri();
+        }
+
+        $this->dispatch(fn () => new ClientConnecting($this, $endpointUrl));
+        $this->logger->info('Connecting to {endpoint}', $this->logContext(['endpoint' => $endpointUrl]));
+
+        try {
+            if (! $this->transport->isConnected()) {
+                $this->transport->connect($host, $port, $this->timeout);
+                $this->logger->debug('TCP connection established to {host}:{port}', $this->logContext(['host' => $host, 'port' => $port]));
+            } else {
+                $this->logger->debug('Transport already connected (reverse-connect flow), skipping connect step', $this->logContext(['host' => $host, 'port' => $port]));
+            }
+
+            $this->doHandshake($endpointUrl);
+            $this->logger->debug('HEL/ACK handshake complete', $this->logContext());
+
+            $this->openSecureChannel();
+            $this->logger->debug('Secure channel opened (channelId={channelId})', $this->logContext(['channelId' => $this->secureChannelId]));
+
+            $this->establishSession($endpointUrl);
+            $this->logger->debug('Session established', $this->logContext());
+        } catch (ConnectionException $e) {
+            $this->connectionState = ConnectionState::Broken;
+            $this->lastEndpointUrl = $endpointUrl;
+            $this->dispatch(fn () => new ConnectionFailed($this, $endpointUrl, $e));
+            $this->logger->error('Connection failed: {message}', $this->logContext(['message' => $e->getMessage(), 'endpoint' => $endpointUrl]));
+            throw $e;
+        }
+
+        $this->lastEndpointUrl = $endpointUrl;
+        $this->connectionState = ConnectionState::Connected;
+
+        $this->discoverServerOperationLimits();
+        $this->logger->info('Connected to {endpoint}', $this->logContext(['endpoint' => $endpointUrl]));
+        $this->dispatch(fn () => new ClientConnected($this, $endpointUrl));
+    }
+
+    /**
+     * @return void
+     * @throws UntrustedCertificateException If the URIs do not match.
+     */
+    private function validateServerApplicationUri(): void
+    {
+        if (! $this->verifyApplicationUri
+            || $this->serverCertDer === null
+            || $this->expectedServerApplicationUri === null
+            || $this->expectedServerApplicationUri === ''
+        ) {
+            return;
+        }
+
+        $certUri = (new CertificateManager())->getApplicationUri($this->serverCertDer);
+        if ($certUri === null) {
+            $this->logger->warning('Server certificate has no SAN ApplicationUri, skipping endpoint binding check', $this->logContext());
+
+            return;
+        }
+
+        if (! hash_equals($this->expectedServerApplicationUri, $certUri)) {
+            $fingerprint = implode(':', str_split(sha1($this->serverCertDer), 2));
+            throw new UntrustedCertificateException(
+                $fingerprint,
+                $this->serverCertDer,
+                "Server certificate ApplicationUri ({$certUri}) does not match endpoint ({$this->expectedServerApplicationUri})",
+            );
+        }
+
+        $this->logger->debug('Server certificate ApplicationUri matches endpoint ({uri})', $this->logContext(['uri' => $certUri]));
+    }
+
+    /**
+     * Reset internal connection state for a fresh connection attempt.
+     *
+     * @return void
+     */
+    private function resetConnectionState(): void
+    {
+        $this->session = null;
+        $this->authenticationToken = null;
+        $this->secureChannelId = 0;
+        $this->secureChannel = null;
+        $this->serverNonce = null;
+        $this->resetBatchingState();
+        if (isset($this->moduleRegistry)) {
+            $this->moduleRegistry->resetAll();
+        }
+    }
+}
