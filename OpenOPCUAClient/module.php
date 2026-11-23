@@ -37,6 +37,7 @@ class OpenOPCUAClient extends IPSModule
         $this->RegisterAttributeString('CertPem', '');
         $this->RegisterAttributeString('KeyPem', '');
         $this->RegisterAttributeString('BrowseResult', '[]');
+        $this->RegisterAttributeString('AppliedNames', '{}');
 
         $this->RegisterTimer('Update', 0, 'OOPCUA_Update($_IPS[\'TARGET\']);');
 
@@ -65,6 +66,8 @@ class OpenOPCUAClient extends IPSModule
         $nodes = $this->getNodes();
         $keep = [];
         $pos = 0;
+        $applied = json_decode($this->ReadAttributeString('AppliedNames'), true) ?: [];
+        $newApplied = [];
         foreach ($nodes as $n) {
             $ident = OpenOPCUAHelper::ident($n['NodeId']);
             $keep[$ident] = true;
@@ -74,13 +77,22 @@ class OpenOPCUAClient extends IPSModule
                 (int) $n['BuiltinType'] === 13 && !$n['Array'] => '~UnixTimestamp',
                 default => '',
             };
-            $this->MaintainVariable($ident, $n['Name'] !== '' ? $n['Name'] : $n['NodeId'], $type, $profile, ++$pos * 10, true);
+            $name = $n['Name'] !== '' ? $n['Name'] : $n['NodeId'];
+            $this->MaintainVariable($ident, $name, $type, $profile, ++$pos * 10, true);
+            // Umbenennung in der Liste übernehmen; Umbenennungen im Objektbaum bleiben sonst unangetastet
+            $vid = @$this->GetIDForIdent($ident);
+            if ($vid && ($applied[$ident] ?? null) !== $name) {
+                IPS_SetName($vid, $name);
+            }
+            $newApplied[$ident] = $name;
             if ($n['Writable'] && !$n['Array']) {
                 $this->EnableAction($ident);
             } else {
                 $this->DisableAction($ident);
             }
         }
+        $this->WriteAttributeString('AppliedNames', json_encode($newApplied, JSON_UNESCAPED_UNICODE));
+
         // Variablen entfernter Nodes löschen (nur eigene, am Ident erkennbar)
         foreach (IPS_GetChildrenIDs($this->InstanceID) as $child) {
             $obj = IPS_GetObject($child);
@@ -231,11 +243,26 @@ class OpenOPCUAClient extends IPSModule
         foreach (json_decode($this->ReadAttributeString('BrowseResult'), true) ?: [] as $b) {
             $browse[$b['NodeId']] = $b;
         }
+        // Ausgewählte Structs durch ihre Elemente ersetzen
+        $expanded = [];
+        foreach ($ids as $id) {
+            if (!empty($browse[$id]['IsStruct'])) {
+                foreach ($browse as $b) {
+                    if (in_array($id, $b['Ancestors'] ?? [], true) && empty($b['IsStruct'])) {
+                        $expanded[] = $b['NodeId'];
+                    }
+                }
+            } else {
+                $expanded[] = $id;
+            }
+        }
+        $ids = array_values(array_unique($expanded));
+
         $nodes = $this->getNodes();
         $existing = array_column($nodes, 'NodeId');
         $added = 0;
         foreach ($ids as $id) {
-            if (in_array($id, $existing, true) || !isset($browse[$id]) || !$browse[$id]['Supported']) {
+            if (in_array($id, $existing, true) || !isset($browse[$id]) || !$browse[$id]['Supported'] || !empty($browse[$id]['IsStruct'])) {
                 continue;
             }
             $b = $browse[$id];
@@ -801,6 +828,20 @@ class OpenOPCUAClient extends IPSModule
         return implode(' / ', array_slice($parts, -2)) ?: '–';
     }
 
+    /** Name ohne vorangestellten Struct-Namen, wenn dieser schon als Gruppe angezeigt wird */
+    private function shortName(array $n): string
+    {
+        $name = $n['Name'] !== '' ? $n['Name'] : $n['NodeId'];
+        $parts = explode('/', $n['Path']);
+        if (count($parts) >= 2) {
+            $prefix = $parts[count($parts) - 2] . ' - ';
+            if (str_starts_with($name, $prefix) && strlen($name) > strlen($prefix)) {
+                return substr($name, strlen($prefix));
+            }
+        }
+        return $name;
+    }
+
     private function liveRows(): array
     {
         $live = $this->getLive();
@@ -810,7 +851,7 @@ class OpenOPCUAClient extends IPSModule
             $status = $l['s'] ?? null;
             $rows[] = [
                 'Group'    => $this->groupOf($n),
-                'Name'     => $n['Name'],
+                'Name'     => $this->shortName($n),
                 'Value'    => $l['f'] ?? '–',
                 'Type'     => $n['Type'],
                 'Access'   => $n['Writable'] ? 'R/W' : 'R',
@@ -848,14 +889,14 @@ class OpenOPCUAClient extends IPSModule
             }
             $imported = isset($existing[$b['NodeId']]);
             $rows[] = [
-                'Import'   => $selectAll && $b['Supported'] && !$imported,
+                'Import'   => $selectAll && $b['Supported'] && empty($b['IsStruct']) && !$imported,
                 'Path'     => $b['Path'],
                 'NodeId'   => $b['NodeId'],
-                'Type'     => (OpenOPCUAHelper::TYPE_NAMES[$b['BuiltinType']] ?? 'Struktur') . ($b['ValueRank'] >= 0 ? '[]' : ''),
-                'Access'   => $b['Writable'] ? 'R/W' : 'R',
+                'Type'     => !empty($b['IsStruct']) ? 'Struct' : (OpenOPCUAHelper::TYPE_NAMES[$b['BuiltinType']] ?? '?') . ($b['ValueRank'] >= 0 ? '[]' : ''),
+                'Access'   => !empty($b['IsStruct']) ? '' : ($b['Writable'] ? 'R/W' : 'R'),
                 'Value'    => mb_strimwidth((string) $b['Value'], 0, 40, '…'),
                 'Hint'     => $imported ? 'bereits übernommen' : $b['Hint'],
-                'rowColor' => $imported ? '#C8F0C8' : ($b['Supported'] ? '' : '#E8E8E8'),
+                'rowColor' => $imported ? '#C8F0C8' : (!empty($b['IsStruct']) ? '#DDEBFA' : ($b['Supported'] ? '' : '#E8E8E8')),
             ];
         }
         return $rows;
@@ -868,7 +909,7 @@ class OpenOPCUAClient extends IPSModule
             return 'Noch nicht durchsucht – "Server durchsuchen" klicken.';
         }
         $sup = count(array_filter($all, static fn ($b) => $b['Supported']));
-        return count($all) . " Variablen gefunden, davon {$sup} übernehmbar. Grün = bereits übernommen, grau = Struktur (Elemente einzeln wählen).";
+        return count($all) . " Variablen gefunden, davon {$sup} übernehmbar. Grün = bereits übernommen, blau = Struct (übernimmt alle Elemente), grau = nicht unterstützt.";
     }
 
     private function visualizationPayload(): string
@@ -884,7 +925,7 @@ class OpenOPCUAClient extends IPSModule
             $status = isset($l['s']) ? (int) $l['s'] : null;
             $rows[] = [
                 'i'  => $ident,
-                'n'  => $n['Name'] ?: $n['NodeId'],
+                'n'  => $this->shortName($n),
                 'g'  => $this->groupOf($n),
                 'id' => $n['NodeId'],
                 'f'  => $l['f'] ?? '–',

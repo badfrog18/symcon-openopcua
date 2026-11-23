@@ -124,11 +124,12 @@ final class OpenOPCUAHelper
     {
         $found = [];
         $visited = [];
-        $queue = [[$root, '', 0]];
+        // [NodeId, Pfad, Tiefe, Namen der Struct-Vorfahren, NodeIds der Struct-Vorfahren]
+        $queue = [[$root, '', 0, [], []]];
         $classes = [NodeClass::Object, NodeClass::Variable];
 
         while ($queue && count($found) < $maxNodes) {
-            [$nodeId, $path, $depth] = array_shift($queue);
+            [$nodeId, $path, $depth, $structNames, $structIds] = array_shift($queue);
             if (isset($visited[$nodeId])) {
                 continue;
             }
@@ -149,11 +150,21 @@ final class OpenOPCUAHelper
                 }
                 $name = (string) ($ref->displayName->text ?? '') ?: $ref->browseName->name;
                 $childPath = $path === '' ? $name : $path . '/' . $name;
-                if ($ref->nodeClass === NodeClass::Variable && !isset($found[$id])) {
-                    $found[$id] = ['NodeId' => $id, 'Path' => $childPath, 'Name' => $name];
+                $isVar = $ref->nodeClass === NodeClass::Variable;
+                if ($isVar && !isset($found[$id])) {
+                    $found[$id] = [
+                        'NodeId'    => $id,
+                        'Path'      => $childPath,
+                        // Struct-Elemente bekommen den Struct-Namen vorangestellt ("Klima WZ - CMD_Mode")
+                        'Name'      => $structNames ? implode(' - ', $structNames) . ' - ' . $name : $name,
+                        'Ancestors' => $structIds,
+                    ];
                 }
                 if ($depth + 1 < $maxDepth) {
-                    $queue[] = [$id, $childPath, $depth + 1];
+                    // Unterhalb einer Variable (= Struct) die Struct-Kette weiterreichen
+                    $queue[] = $isVar
+                        ? [$id, $childPath, $depth + 1, [...$structNames, $name], [...$structIds, $id]]
+                        : [$id, $childPath, $depth + 1, [], []];
                 }
             }
         }
@@ -191,6 +202,22 @@ final class OpenOPCUAHelper
             }
         }
 
+        $isAncestor = [];
+        foreach ($found as $node) {
+            foreach ($node['Ancestors'] as $anc) {
+                $isAncestor[$anc] = true;
+            }
+        }
+        $hasMembers = [];   // Anzahl der Blatt-Elemente je Struct
+        foreach ($found as $nid => $node) {
+            if (isset($isAncestor[$nid])) {
+                continue;
+            }
+            foreach ($node['Ancestors'] as $anc) {
+                $hasMembers[$anc] = ($hasMembers[$anc] ?? 0) + 1;
+            }
+        }
+
         $out = [];
         $i = 0;
         foreach ($found as $id => $node) {
@@ -216,9 +243,12 @@ final class OpenOPCUAHelper
 
             $hint = '';
             $supported = true;
-            if ($builtin === 0) {
+            $isStruct = isset($hasMembers[$id]) && ($builtin === 0 || $builtin === 22);
+            if ($isStruct) {
+                $hint = 'Struct – übernimmt alle ' . $hasMembers[$id] . ' Elemente';
+            } elseif ($builtin === 0) {
                 $supported = false;
-                $hint = 'Struktur/unbekannter Typ – Elemente einzeln übernehmen';
+                $hint = 'Unbekannter Datentyp – nicht übernehmbar';
             } elseif ($isArray) {
                 $hint = 'Array → nur lesend als JSON-Text';
             }
@@ -226,11 +256,12 @@ final class OpenOPCUAHelper
             $out[] = $node + [
                 'BuiltinType' => $builtin,
                 'ValueRank'   => $isArray ? 1 : -1,
-                'Writable'    => $supported && !$isArray && ($access & 0x02) === 0x02,
+                'IsStruct'    => $isStruct,
+                'Writable'    => $supported && !$isStruct && !$isArray && ($access & 0x02) === 0x02,
                 'Readable'    => ($access & 0x01) === 0x01,
                 'Supported'   => $supported,
                 'Hint'        => $hint,
-                'Value'       => $supported ? self::formatValue($valDv->getValue(), $builtin, $isArray) : '',
+                'Value'       => $supported && !$isStruct ? self::formatValue($valDv->getValue(), $builtin, $isArray) : '',
             ];
         }
         usort($out, static fn ($a, $b) => strnatcasecmp($a['Path'], $b['Path']));
