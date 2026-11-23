@@ -16,6 +16,8 @@ class OpenOPCUAClient extends IPSModule
     private const STATUS_NO_NODES = 202;
     private const STATUS_CERT_ERROR = 203;
 
+    private ?array $ancestorCache = null;
+
     public function Create(): void
     {
         parent::Create();
@@ -33,6 +35,7 @@ class OpenOPCUAClient extends IPSModule
         $this->RegisterPropertyString('BrowseRoot', 'i=85');
         $this->RegisterPropertyInteger('BrowseDepth', 10);
         $this->RegisterPropertyString('Nodes', '[]');
+        $this->RegisterPropertyBoolean('StructAsCategory', true);
 
         $this->RegisterAttributeString('CertPem', '');
         $this->RegisterAttributeString('KeyPem', '');
@@ -64,7 +67,11 @@ class OpenOPCUAClient extends IPSModule
 
         // Variablen pflegen
         $nodes = $this->getNodes();
+        $asCategory = $this->ReadPropertyBoolean('StructAsCategory');
+        $existing = $this->scanOwnObjects();          // ident → ObjektID (Variablen + Kategorien im ganzen Teilbaum)
         $keep = [];
+        $keepCats = [];
+        $varMap = [];
         $pos = 0;
         $applied = json_decode($this->ReadAttributeString('AppliedNames'), true) ?: [];
         $newApplied = [];
@@ -77,11 +84,27 @@ class OpenOPCUAClient extends IPSModule
                 (int) $n['BuiltinType'] === 13 && !$n['Array'] => '~UnixTimestamp',
                 default => '',
             };
+
+            // Liegt die Variable in einer Struct-Kategorie, kurz zurück unter die Instanz holen,
+            // damit MaintainVariable/EnableAction sie über den Ident finden
+            if (isset($existing[$ident]) && IPS_GetParent($existing[$ident]) !== $this->InstanceID) {
+                IPS_SetParent($existing[$ident], $this->InstanceID);
+            }
+
+            $chain = $asCategory ? $this->structChain($n) : [];
             $name = $n['Name'] !== '' ? $n['Name'] : $n['NodeId'];
+            if ($chain) {
+                // In der Kategorie reicht der Elementname ("CMD_Mode" statt "Klima WZ - CMD_Mode")
+                $prefix = implode(' - ', $chain) . ' - ';
+                if (str_starts_with($name, $prefix) && strlen($name) > strlen($prefix)) {
+                    $name = substr($name, strlen($prefix));
+                }
+            }
+
             $this->MaintainVariable($ident, $name, $type, $profile, ++$pos * 10, true);
+            $vid = $this->GetIDForIdent($ident);
             // Umbenennung in der Liste übernehmen; Umbenennungen im Objektbaum bleiben sonst unangetastet
-            $vid = @$this->GetIDForIdent($ident);
-            if ($vid && ($applied[$ident] ?? null) !== $name) {
+            if (($applied[$ident] ?? null) !== $name) {
                 IPS_SetName($vid, $name);
             }
             $newApplied[$ident] = $name;
@@ -90,16 +113,44 @@ class OpenOPCUAClient extends IPSModule
             } else {
                 $this->DisableAction($ident);
             }
+
+            if ($chain) {
+                $parent = $this->InstanceID;
+                $sub = '';
+                foreach ($chain as $level => $catName) {
+                    $sub .= '/' . $catName;
+                    $catIdent = 'C' . substr(md5($this->groupKey($n) . $sub), 0, 16);
+                    $keepCats[$catIdent] = true;
+                    $cat = $existing[$catIdent] ?? 0;
+                    if (!$cat || !IPS_ObjectExists($cat)) {
+                        $cat = IPS_CreateCategory();
+                        IPS_SetIdent($cat, $catIdent);
+                        IPS_SetName($cat, $catName);
+                        IPS_SetPosition($cat, $pos * 10);
+                        $existing[$catIdent] = $cat;
+                    }
+                    if (IPS_GetParent($cat) !== $parent) {
+                        IPS_SetParent($cat, $parent);
+                    }
+                    $parent = $cat;
+                }
+                IPS_SetParent($vid, $parent);
+            }
+            $varMap[$ident] = $vid;
         }
         $this->WriteAttributeString('AppliedNames', json_encode($newApplied, JSON_UNESCAPED_UNICODE));
+        $this->SetBuffer('VarMap', json_encode($varMap));
 
-        // Variablen entfernter Nodes löschen (nur eigene, am Ident erkennbar)
-        foreach (IPS_GetChildrenIDs($this->InstanceID) as $child) {
-            $obj = IPS_GetObject($child);
-            if ($obj['ObjectType'] === 2 && preg_match('/^N[0-9a-f]{16}$/', $obj['ObjectIdent']) && !isset($keep[$obj['ObjectIdent']])) {
-                $this->UnregisterVariable($obj['ObjectIdent']);
+        // Variablen entfernter Nodes und leere eigene Kategorien löschen (nur eigene, am Ident erkennbar)
+        foreach ($this->scanOwnObjects() as $ident => $oid) {
+            if ($ident[0] === 'N' && !isset($keep[$ident])) {
+                if (IPS_GetParent($oid) !== $this->InstanceID) {
+                    IPS_SetParent($oid, $this->InstanceID);
+                }
+                $this->UnregisterVariable($ident);
             }
         }
+        $this->removeEmptyCategories($this->InstanceID, $keepCats);
 
         // Zertifikat bereitstellen, falls Security aktiv
         if ($this->ReadPropertyString('SecurityPolicy') !== 'None') {
@@ -164,10 +215,7 @@ class OpenOPCUAClient extends IPSModule
                 if (!OpenOPCUAHelper::isBad($status)) {
                     $value = $dv->getValue();
                     $ipsValue = OpenOPCUAHelper::toIps($value, (int) $n['BuiltinType'], (bool) $n['Array']);
-                    $id = @$this->GetIDForIdent($ident);
-                    if ($id !== false && $id > 0 && GetValue($id) !== $ipsValue) {
-                        $this->SetValue($ident, $ipsValue);
-                    }
+                    $this->setVar($ident, $ipsValue);
                     $entry['v'] = is_scalar($ipsValue) ? $ipsValue : null;
                     $entry['f'] = OpenOPCUAHelper::formatValue($value, (int) $n['BuiltinType'], (bool) $n['Array']);
                     $entry['t'] = $dv->sourceTimestamp?->getTimestamp() ?? $now;
@@ -266,7 +314,11 @@ class OpenOPCUAClient extends IPSModule
                 continue;
             }
             $b = $browse[$id];
-            $nodes[] = $this->nodeRow($b['NodeId'], $b['Name'], $b['Path'], (int) $b['BuiltinType'], $b['ValueRank'] >= 0, (bool) $b['Writable']);
+            $depth = count($b['Ancestors'] ?? []);
+            $parents = explode('/', $b['Path']);
+            array_pop($parents);
+            $struct = $depth > 0 ? implode('/', array_slice($parents, -$depth)) : '';
+            $nodes[] = $this->nodeRow($b['NodeId'], $b['Name'], $b['Path'], (int) $b['BuiltinType'], $b['ValueRank'] >= 0, (bool) $b['Writable'], $struct);
             $added++;
         }
         if ($added > 0) {
@@ -481,6 +533,7 @@ class OpenOPCUAClient extends IPSModule
                         ['type' => 'NumberSpinner', 'name' => 'BrowseDepth', 'caption' => 'Max. Tiefe', 'minimum' => 1, 'maximum' => 30],
                     ],
                 ],
+                ['type' => 'CheckBox', 'name' => 'StructAsCategory', 'caption' => 'Structs als Kategorie im Objektbaum anlegen'],
                 [
                     'type'     => 'List',
                     'name'     => 'Nodes',
@@ -498,6 +551,7 @@ class OpenOPCUAClient extends IPSModule
                         ['caption' => 'Schreiben', 'name' => 'Writable', 'width' => '90px', 'add' => false, 'edit' => ['type' => 'CheckBox']],
                         ['caption' => 'BuiltinType', 'name' => 'BuiltinType', 'add' => 0, 'visible' => false],
                         ['caption' => 'Array', 'name' => 'Array', 'add' => false, 'visible' => false],
+                        ['caption' => 'Struct', 'name' => 'Struct', 'add' => '', 'visible' => false],
                     ],
                 ],
             ],
@@ -682,7 +736,7 @@ class OpenOPCUAClient extends IPSModule
         if ($ok === true) {
             $ident = OpenOPCUAHelper::ident($n['NodeId']);
             $ipsValue = OpenOPCUAHelper::toIps($typed, (int) $n['BuiltinType'], false);
-            $this->SetValue($ident, $ipsValue);
+            $this->setVar($ident, $ipsValue);
             $live = $this->getLive();
             $live[$ident] = ['v' => $ipsValue, 'f' => OpenOPCUAHelper::formatValue($typed, (int) $n['BuiltinType'], false), 's' => 0, 't' => time()];
             $this->SetBuffer('Live', json_encode($live));
@@ -752,6 +806,78 @@ class OpenOPCUAClient extends IPSModule
         return IPS_GetKernelDir() . 'webfront' . DIRECTORY_SEPARATOR . 'user' . DIRECTORY_SEPARATOR . 'OpenOPCUA_' . $this->InstanceID . '.der';
     }
 
+    /** Eigene Variablen (N…) und Struct-Kategorien (C…) im gesamten Teilbaum der Instanz */
+    private function scanOwnObjects(int $parent = 0): array
+    {
+        $parent = $parent ?: $this->InstanceID;
+        $out = [];
+        foreach (IPS_GetChildrenIDs($parent) as $child) {
+            $obj = IPS_GetObject($child);
+            if ($obj['ObjectType'] === 2 && preg_match('/^N[0-9a-f]{16}$/', $obj['ObjectIdent'])) {
+                $out[$obj['ObjectIdent']] = $child;
+            } elseif ($obj['ObjectType'] === 0 && preg_match('/^C[0-9a-f]{16}$/', $obj['ObjectIdent'])) {
+                $out[$obj['ObjectIdent']] = $child;
+                $out += $this->scanOwnObjects($child);
+            }
+        }
+        return $out;
+    }
+
+    private function removeEmptyCategories(int $parent, array $keepCats): void
+    {
+        foreach (IPS_GetChildrenIDs($parent) as $child) {
+            $obj = IPS_GetObject($child);
+            if ($obj['ObjectType'] !== 0 || !preg_match('/^C[0-9a-f]{16}$/', $obj['ObjectIdent'])) {
+                continue;
+            }
+            $this->removeEmptyCategories($child, $keepCats);
+            if (!IPS_HasChildren($child) && !isset($keepCats[$obj['ObjectIdent']])) {
+                IPS_DeleteCategory($child);
+            }
+        }
+    }
+
+    /** Namen der Structs, in denen die Node liegt (äußerster zuerst) */
+    private function structChain(array $n): array
+    {
+        if ($n['Struct'] !== null) {
+            return $n['Struct'] === '' ? [] : explode('/', $n['Struct']);
+        }
+        // Ältere Einträge ohne Struct-Info: aus dem letzten Browse-Ergebnis ableiten
+        if ($this->ancestorCache === null) {
+            $this->ancestorCache = [];
+            foreach (json_decode($this->ReadAttributeString('BrowseResult'), true) ?: [] as $b) {
+                $this->ancestorCache[$b['NodeId']] = count($b['Ancestors'] ?? []);
+            }
+        }
+        $depth = $this->ancestorCache[$n['NodeId']] ?? 0;
+        if ($depth === 0) {
+            return [];
+        }
+        $parts = explode('/', $n['Path']);
+        array_pop($parts);
+        return array_slice($parts, -$depth);
+    }
+
+    /** Ordner oberhalb des Structs – damit gleichnamige Structs in verschiedenen Ordnern getrennt bleiben */
+    private function groupKey(array $n): string
+    {
+        $parts = explode('/', $n['Path']);
+        return implode('/', array_slice($parts, 0, max(0, count($parts) - 1 - count($this->structChain($n)))));
+    }
+
+    private function setVar(string $ident, mixed $value): void
+    {
+        $map = json_decode($this->GetBuffer('VarMap'), true) ?: [];
+        $vid = $map[$ident] ?? 0;
+        if (!$vid || !IPS_VariableExists($vid)) {
+            $vid = $this->scanOwnObjects()[$ident] ?? 0;
+        }
+        if ($vid && GetValue($vid) !== $value) {
+            SetValue($vid, $value);
+        }
+    }
+
     /** @return array<int, array> normalisierte Node-Liste */
     private function getNodes(): array
     {
@@ -770,6 +896,7 @@ class OpenOPCUAClient extends IPSModule
                 'Writable'    => (bool) ($n['Writable'] ?? false),
                 'BuiltinType' => (int) ($n['BuiltinType'] ?? 12),
                 'Array'       => (bool) ($n['Array'] ?? false),
+                'Struct'      => isset($n['Struct']) ? (string) $n['Struct'] : null,
             ];
         }
         return $out;
@@ -790,9 +917,10 @@ class OpenOPCUAClient extends IPSModule
         return null;
     }
 
-    private function nodeRow(string $nodeId, string $name, string $path, int $builtin, bool $array, bool $writable): array
+    private function nodeRow(string $nodeId, string $name, string $path, int $builtin, bool $array, bool $writable, string $struct = ''): array
     {
         return [
+            'Struct'      => $struct,
             'Active'      => true,
             'Name'        => $name,
             'Path'        => $path,

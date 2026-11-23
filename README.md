@@ -46,7 +46,7 @@ Bei Security ≠ None muss die SPS das Client-Zertifikat vertrauen. Entweder in 
 | Namen anpassen, Variablen (de)aktivieren, Schreibrecht | Liste „Übernommene Variablen“ → Übernehmen |
 | Übersicht ansehen | „Live-Übersicht“ oder Instanz in die Kachelvisu ziehen |
 
-**Structs/UDTs**: Den Struct anhaken (blau markiert), dann werden alle seine Elemente übernommen, auch verschachtelte. Die Variablen heißen dann z. B. „Klima WZ - CMD_Mode“, damit gleichnamige Elemente mehrerer Structs unterscheidbar sind. In Kachel und Live-Übersicht ist der Struct die Gruppe. Umbenennen geht in der Liste „Übernommene Variablen“, der neue Name wird auf die IPS-Variable übertragen.
+**Structs/UDTs**: Den Struct anhaken (blau markiert), dann werden alle seine Elemente übernommen, auch verschachtelte. Die Variablen heißen dann z. B. „Klima WZ - CMD_Mode“, damit gleichnamige Elemente mehrerer Structs unterscheidbar sind. In Kachel und Live-Übersicht ist der Struct die Gruppe. Mit der Option **„Structs als Kategorie im Objektbaum anlegen“** (Standard: an) wird jeder Struct zu einer Kategorie unter der Instanz, verschachtelte Structs zu Unterkategorien. Die Variablen heißen darin nur noch wie das Element (`CMD_Mode`) und bleiben bedienbar. Umbenennen geht in der Liste „Übernommene Variablen“, der neue Name wird auf die IPS-Variable übertragen.
 
 ### Typzuordnung
 
