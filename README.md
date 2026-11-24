@@ -70,10 +70,18 @@ OOPCUA_WriteNode(int $InstanzID, string $NodeId, $Wert): bool
 OOPCUA_Browse(int $InstanzID): int                        // Server durchsuchen, liefert Anzahl
 OOPCUA_AddNode(int $InstanzID, string $NodeId, string $Name): bool
 OOPCUA_RenewCertificate(int $InstanzID): bool
+OOPCUA_RemapNodes(int $InstanzID): string                // NodeIds über den Pfad neu zuordnen (nach Umbau der Serverschnittstelle)
+OOPCUA_AdoptVariables(int $InstanzID, string $Map): string // bestehende Variablen übernehmen: {"VariablenID": "NodeId", …}
 
 // Beispiel
 OOPCUA_WriteNode(12345, 'ns=3;s="DB_IPS"."Pumpe_Ein"', true);
 ```
+
+## Umstieg von einer anderen Anbindung (z. B. S7 PUT/GET)
+
+Mit `OOPCUA_AdoptVariables` ziehen bestehende Variablen in die Instanz um und werden an eine Node gebunden. ID, Name, Profil, Archivdaten, Events und Links bleiben erhalten. Der Datentyp wird vorher geprüft. Skripte schreiben danach einfach mit `RequestAction(VariablenID, Wert)`.
+
+Ändern sich nach einem Umbau der Serverschnittstelle die NodeIds, ordnet **„NodeIds über Pfad neu zuordnen“** die Nodes über ihren Pfad neu zu. Die IPS-Variablen bleiben dabei dieselben.
 
 ## Grenzen
 

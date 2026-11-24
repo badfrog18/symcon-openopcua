@@ -76,7 +76,7 @@ class OpenOPCUAClient extends IPSModule
         $applied = json_decode($this->ReadAttributeString('AppliedNames'), true) ?: [];
         $newApplied = [];
         foreach ($nodes as $n) {
-            $ident = OpenOPCUAHelper::ident($n['NodeId']);
+            $ident = $this->identOf($n);
             $keep[$ident] = true;
             $type = OpenOPCUAHelper::ipsType((int) $n['BuiltinType'], (bool) $n['Array']);
             $profile = match (true) {
@@ -208,7 +208,7 @@ class OpenOPCUAClient extends IPSModule
                 if ($dv === null) {
                     continue;
                 }
-                $ident = OpenOPCUAHelper::ident($n['NodeId']);
+                $ident = $this->identOf($n);
                 $status = $dv->statusCode;
                 $entry = $live[$ident] ?? ['v' => null, 'f' => '–'];
                 $entry['s'] = $status;
@@ -325,6 +325,122 @@ class OpenOPCUAClient extends IPSModule
             $this->saveNodes($nodes);
         }
         return $added;
+    }
+
+    /**
+     * Übernimmt bestehende IPS-Variablen (z. B. von einer alten S7-Anbindung) samt ID, Archiv, Events und Links.
+     * $Map: JSON-Objekt {"VariablenID": "NodeId", …}. Die Nodes müssen im Browse-Ergebnis oder in der Liste stehen.
+     * Liefert ein Protokoll (eine Zeile je Variable).
+     */
+    public function AdoptVariables(string $Map): string
+    {
+        $map = json_decode($Map, true);
+        if (!is_array($map)) {
+            return 'Ungültiges JSON';
+        }
+        $browse = [];
+        foreach (json_decode($this->ReadAttributeString('BrowseResult'), true) ?: [] as $b) {
+            $browse[$b['NodeId']] = $b;
+        }
+        $nodes = $this->getNodes();
+        $index = [];
+        foreach ($nodes as $i => $n) {
+            $index[$n['NodeId']] = $i;
+        }
+        $own = $this->scanOwnObjects();
+        $applied = json_decode($this->ReadAttributeString('AppliedNames'), true) ?: [];
+        $log = [];
+
+        foreach ($map as $varId => $nodeId) {
+            $varId = (int) $varId;
+            if (!IPS_VariableExists($varId)) {
+                $log[] = "✗ $varId: Variable existiert nicht";
+                continue;
+            }
+            // Node in der Liste anlegen, falls noch nicht vorhanden
+            if (!isset($index[$nodeId])) {
+                $b = $browse[$nodeId] ?? null;
+                if ($b === null || !$b['Supported'] || !empty($b['IsStruct'])) {
+                    $log[] = "✗ $varId: Node $nodeId nicht im Browse-Ergebnis (vorher \"Server durchsuchen\")";
+                    continue;
+                }
+                $depth = count($b['Ancestors'] ?? []);
+                $parents = explode('/', $b['Path']);
+                array_pop($parents);
+                $nodes[] = $this->nodeRow($b['NodeId'], $b['Name'], $b['Path'], (int) $b['BuiltinType'], $b['ValueRank'] >= 0, (bool) $b['Writable'],
+                    $depth > 0 ? implode('/', array_slice($parents, -$depth)) : '');
+                $index[$nodeId] = count($nodes) - 1;
+            }
+            $n = &$nodes[$index[$nodeId]];
+            $want = OpenOPCUAHelper::ipsType((int) $n['BuiltinType'], (bool) $n['Array']);
+            $have = IPS_GetVariable($varId)['VariableType'];
+            if ($want !== $have) {
+                $log[] = sprintf('✗ %d %s: Typ passt nicht (IPS %s, OPC UA %s)', $varId, IPS_GetName($varId), ['Bool', 'Int', 'Float', 'String'][$have], $n['Type']);
+                unset($n);
+                continue;
+            }
+            $ident = $this->identOf($n);
+            $n['Ident'] = $ident;
+            $n['Active'] = true;
+            $n['Name'] = IPS_GetName($varId);          // vorhandenen Namen behalten
+            $applied[$ident] = $n['Name'];
+            // Bisherige (neu angelegte) Modul-Variable für diese Node ersetzen
+            if (isset($own[$ident]) && $own[$ident] !== $varId) {
+                IPS_DeleteVariable($own[$ident]);
+            }
+            IPS_SetParent($varId, $this->InstanceID);
+            IPS_SetIdent($varId, $ident);
+            $own[$ident] = $varId;
+            $log[] = "✓ $varId " . IPS_GetName($varId) . " → $nodeId";
+            unset($n);
+        }
+        $this->WriteAttributeString('AppliedNames', json_encode($applied, JSON_UNESCAPED_UNICODE));
+        $this->saveNodes($nodes);
+        return implode("\n", $log);
+    }
+
+    /**
+     * Ordnet Nodes, deren NodeId sich geändert hat (z. B. nach Umbau der Serverschnittstelle), über den Pfad neu zu.
+     * Die IPS-Variablen bleiben dabei unverändert (Ident bleibt erhalten).
+     */
+    public function RemapNodes(): string
+    {
+        if ($this->Browse() < 0) {
+            return 'Durchsuchen fehlgeschlagen';
+        }
+        $byPath = [];
+        $byId = [];
+        foreach (json_decode($this->ReadAttributeString('BrowseResult'), true) ?: [] as $b) {
+            $byPath[$b['Path']] = $b;
+            $byId[$b['NodeId']] = $b;
+        }
+        $nodes = $this->getNodes();
+        $log = [];
+        $changed = false;
+        foreach ($nodes as &$n) {
+            if (isset($byId[$n['NodeId']]) && $byId[$n['NodeId']]['Path'] === $n['Path']) {
+                continue;
+            }
+            $b = $byPath[$n['Path']] ?? null;
+            if ($b === null) {
+                $log[] = "✗ {$n['Path']}: nicht mehr vorhanden";
+                continue;
+            }
+            $n['Ident'] = $this->identOf($n);
+            $log[] = "✓ {$n['Path']}: {$n['NodeId']} → {$b['NodeId']}";
+            $n['NodeId'] = $b['NodeId'];
+            if ((int) $b['BuiltinType'] !== $n['BuiltinType']) {
+                $log[] = "  ⚠ Datentyp geändert: {$n['Type']} → " . (OpenOPCUAHelper::TYPE_NAMES[$b['BuiltinType']] ?? '?');
+                $n['BuiltinType'] = (int) $b['BuiltinType'];
+                $n['Type'] = OpenOPCUAHelper::TYPE_NAMES[$b['BuiltinType']] ?? '?';
+            }
+            $changed = true;
+        }
+        unset($n);
+        if ($changed) {
+            $this->saveNodes($nodes);
+        }
+        return $log ? implode("\n", $log) : 'Alle Nodes aktuell';
     }
 
     /** Fügt eine NodeId manuell hinzu (Datentyp wird vom Server gelesen). */
@@ -452,7 +568,7 @@ class OpenOPCUAClient extends IPSModule
 
         // Schreiben auf eine Node-Variable
         foreach ($this->getNodes() as $n) {
-            if (OpenOPCUAHelper::ident($n['NodeId']) === $Ident) {
+            if ($this->identOf($n) === $Ident) {
                 if (!$n['Writable']) {
                     echo 'Variable ist nur lesbar';
                     return;
@@ -552,6 +668,7 @@ class OpenOPCUAClient extends IPSModule
                         ['caption' => 'BuiltinType', 'name' => 'BuiltinType', 'add' => 0, 'visible' => false],
                         ['caption' => 'Array', 'name' => 'Array', 'add' => false, 'visible' => false],
                         ['caption' => 'Struct', 'name' => 'Struct', 'add' => '', 'visible' => false],
+                        ['caption' => 'Ident', 'name' => 'Ident', 'add' => '', 'visible' => false],
                     ],
                 ],
             ],
@@ -560,6 +677,7 @@ class OpenOPCUAClient extends IPSModule
                     ['type' => 'Button', 'caption' => 'Verbindung testen', 'onClick' => 'IPS_RequestAction($id, "TestConnection", "");'],
                     ['type' => 'Button', 'caption' => 'Server durchsuchen', 'onClick' => 'IPS_RequestAction($id, "Browse", "");'],
                     ['type' => 'Button', 'caption' => 'Werte jetzt lesen', 'onClick' => 'IPS_RequestAction($id, "ReadNow", "");'],
+                    ['type' => 'Button', 'caption' => 'NodeIds über Pfad neu zuordnen', 'onClick' => 'echo OOPCUA_RemapNodes($id);'],
                     ['type' => 'ProgressBar', 'name' => 'BrowseProgress', 'indeterminate' => true, 'visible' => false, 'caption' => 'Durchsuche …', 'width' => '200px'],
                 ]],
                 [
@@ -734,7 +852,7 @@ class OpenOPCUAClient extends IPSModule
         }, 'Schreiben ' . $n['Name'], true);
 
         if ($ok === true) {
-            $ident = OpenOPCUAHelper::ident($n['NodeId']);
+            $ident = $this->identOf($n);
             $ipsValue = OpenOPCUAHelper::toIps($typed, (int) $n['BuiltinType'], false);
             $this->setVar($ident, $ipsValue);
             $live = $this->getLive();
@@ -804,6 +922,12 @@ class OpenOPCUAClient extends IPSModule
     private function downloadFile(): string
     {
         return IPS_GetKernelDir() . 'webfront' . DIRECTORY_SEPARATOR . 'user' . DIRECTORY_SEPARATOR . 'OpenOPCUA_' . $this->InstanceID . '.der';
+    }
+
+    /** Ident der IPS-Variable – bleibt stabil, auch wenn sich die NodeId später ändert */
+    private function identOf(array $n): string
+    {
+        return ($n['Ident'] ?? '') !== '' ? $n['Ident'] : OpenOPCUAHelper::ident($n['NodeId']);
     }
 
     /** Eigene Variablen (N…) und Struct-Kategorien (C…) im gesamten Teilbaum der Instanz */
@@ -897,6 +1021,7 @@ class OpenOPCUAClient extends IPSModule
                 'BuiltinType' => (int) ($n['BuiltinType'] ?? 12),
                 'Array'       => (bool) ($n['Array'] ?? false),
                 'Struct'      => isset($n['Struct']) ? (string) $n['Struct'] : null,
+                'Ident'       => (string) ($n['Ident'] ?? ''),
             ];
         }
         return $out;
@@ -921,6 +1046,7 @@ class OpenOPCUAClient extends IPSModule
     {
         return [
             'Struct'      => $struct,
+            'Ident'       => '',
             'Active'      => true,
             'Name'        => $name,
             'Path'        => $path,
@@ -975,7 +1101,7 @@ class OpenOPCUAClient extends IPSModule
         $live = $this->getLive();
         $rows = [];
         foreach ($this->getNodes() as $n) {
-            $l = $live[OpenOPCUAHelper::ident($n['NodeId'])] ?? null;
+            $l = $live[$this->identOf($n)] ?? null;
             $status = $l['s'] ?? null;
             $rows[] = [
                 'Group'    => $this->groupOf($n),
@@ -1048,7 +1174,7 @@ class OpenOPCUAClient extends IPSModule
             if (!$n['Active']) {
                 continue;
             }
-            $ident = OpenOPCUAHelper::ident($n['NodeId']);
+            $ident = $this->identOf($n);
             $l = $live[$ident] ?? null;
             $status = isset($l['s']) ? (int) $l['s'] : null;
             $rows[] = [
