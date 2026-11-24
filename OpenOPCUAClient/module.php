@@ -75,10 +75,23 @@ class OpenOPCUAClient extends IPSModule
         $pos = 0;
         $applied = json_decode($this->ReadAttributeString('AppliedNames'), true) ?: [];
         $newApplied = [];
+        $seen = [];
         foreach ($nodes as $n) {
             $ident = $this->identOf($n);
             $keep[$ident] = true;
             $type = OpenOPCUAHelper::ipsType((int) $n['BuiltinType'], (bool) $n['Array']);
+            // Schutz 1: doppelte Idents nie verarbeiten (sonst würden sich zwei Einträge eine Variable teilen)
+            if (isset($seen[$ident])) {
+                $this->LogMessage("Eintrag {$n['Path']} übersprungen: Ident {$ident} doppelt (auch bei {$seen[$ident]})", KL_ERROR);
+                continue;
+            }
+            $seen[$ident] = $n['Path'];
+            // Schutz 2: eine vorhandene Variable mit anderem Datentyp wird NIE gelöscht/neu angelegt
+            if (isset($existing[$ident]) && IPS_VariableExists($existing[$ident]) && IPS_GetVariable($existing[$ident])['VariableType'] !== $type) {
+                $this->LogMessage(sprintf('Variable #%d (%s) nicht angepasst: Datentyp passt nicht zu %s (%s). Bitte prüfen.',
+                    $existing[$ident], IPS_GetName($existing[$ident]), $n['Path'], $n['Type']), KL_ERROR);
+                continue;
+            }
             $profile = match (true) {
                 $type === OpenOPCUAHelper::IPS_BOOL => '~Switch',
                 (int) $n['BuiltinType'] === 13 && !$n['Array'] => '~UnixTimestamp',
@@ -318,7 +331,8 @@ class OpenOPCUAClient extends IPSModule
             $parents = explode('/', $b['Path']);
             array_pop($parents);
             $struct = $depth > 0 ? implode('/', array_slice($parents, -$depth)) : '';
-            $nodes[] = $this->nodeRow($b['NodeId'], $b['Name'], $b['Path'], (int) $b['BuiltinType'], $b['ValueRank'] >= 0, (bool) $b['Writable'], $struct);
+            $nodes[] = $this->nodeRow($b['NodeId'], $b['Name'], $b['Path'], (int) $b['BuiltinType'], $b['ValueRank'] >= 0, (bool) $b['Writable'], $struct,
+                $this->uniqueIdent($b['NodeId'], $nodes));
             $added++;
         }
         if ($added > 0) {
@@ -368,10 +382,16 @@ class OpenOPCUAClient extends IPSModule
                 $parents = explode('/', $b['Path']);
                 array_pop($parents);
                 $nodes[] = $this->nodeRow($b['NodeId'], $b['Name'], $b['Path'], (int) $b['BuiltinType'], $b['ValueRank'] >= 0, (bool) $b['Writable'],
-                    $depth > 0 ? implode('/', array_slice($parents, -$depth)) : '');
+                    $depth > 0 ? implode('/', array_slice($parents, -$depth)) : '', $this->uniqueIdent($b['NodeId'], $nodes));
                 $index[$nodeId] = count($nodes) - 1;
             }
             $n = &$nodes[$index[$nodeId]];
+            // Veralteter Eintrag (NodeId zeigt inzwischen auf eine andere Variable)? → erst neu zuordnen lassen
+            if (isset($browse[$nodeId]) && $n['Path'] !== '' && $browse[$nodeId]['Path'] !== $n['Path']) {
+                $log[] = "✗ $varId: Eintrag für $nodeId ist veraltet ({$n['Path']} ≠ {$browse[$nodeId]['Path']}) – zuerst \"NodeIds über Pfad neu zuordnen\"";
+                unset($n);
+                continue;
+            }
             $want = OpenOPCUAHelper::ipsType((int) $n['BuiltinType'], (bool) $n['Array']);
             $have = IPS_GetVariable($varId)['VariableType'];
             if ($want !== $have) {
@@ -386,7 +406,16 @@ class OpenOPCUAClient extends IPSModule
             $applied[$ident] = $n['Name'];
             // Bisherige (neu angelegte) Modul-Variable für diese Node ersetzen
             if (isset($own[$ident]) && $own[$ident] !== $varId) {
-                IPS_DeleteVariable($own[$ident]);
+                $prev = $own[$ident];
+                $ac = IPS_GetInstanceListByModuleID('{43192F0B-135B-4CE7-A0A7-1475603F3060}')[0] ?? 0;
+                if ($ac && AC_GetLoggingStatus($ac, $prev)) {
+                    // Nie eine archivierte Variable löschen – stattdessen aus der Instanz nehmen
+                    IPS_SetParent($prev, IPS_GetParent($this->InstanceID));
+                    IPS_SetIdent($prev, '');
+                    $log[] = "  ⚠ bisherige Variable #$prev wird archiviert – nicht gelöscht, sondern neben die Instanz verschoben";
+                } else {
+                    IPS_DeleteVariable($prev);
+                }
             }
             IPS_SetParent($varId, $this->InstanceID);
             IPS_SetIdent($varId, $ident);
@@ -417,6 +446,14 @@ class OpenOPCUAClient extends IPSModule
         $nodes = $this->getNodes();
         $log = [];
         $changed = false;
+        // Erst alle Idents festschreiben – danach darf sich keine Variable mehr über eine geänderte NodeId "verschieben"
+        foreach ($nodes as &$n) {
+            if ($n['Ident'] === '') {
+                $n['Ident'] = $this->identOf($n);
+                $changed = true;
+            }
+        }
+        unset($n);
         foreach ($nodes as &$n) {
             if (isset($byId[$n['NodeId']]) && $byId[$n['NodeId']]['Path'] === $n['Path']) {
                 continue;
@@ -426,7 +463,7 @@ class OpenOPCUAClient extends IPSModule
                 $log[] = "✗ {$n['Path']}: nicht mehr vorhanden";
                 continue;
             }
-            $n['Ident'] = $this->identOf($n);
+            $n['Ident'] = $this->identOf($n);   // Ident festschreiben, damit die Variable erhalten bleibt
             $log[] = "✓ {$n['Path']}: {$n['NodeId']} → {$b['NodeId']}";
             $n['NodeId'] = $b['NodeId'];
             if ((int) $b['BuiltinType'] !== $n['BuiltinType']) {
@@ -483,7 +520,8 @@ class OpenOPCUAClient extends IPSModule
             return false;
         }
         $nodes = $this->getNodes();
-        $nodes[] = $this->nodeRow($NodeId, $Name !== '' ? $Name : $info['name'], '', $info['builtin'], $info['array'], $info['writable'] && !$info['array']);
+        $nodes[] = $this->nodeRow($NodeId, $Name !== '' ? $Name : $info['name'], '', $info['builtin'], $info['array'], $info['writable'] && !$info['array'], '',
+            $this->uniqueIdent($NodeId, $nodes));
         $this->saveNodes($nodes);
         return true;
     }
@@ -1042,11 +1080,25 @@ class OpenOPCUAClient extends IPSModule
         return null;
     }
 
-    private function nodeRow(string $nodeId, string $name, string $path, int $builtin, bool $array, bool $writable, string $struct = ''): array
+    /** Liefert einen Ident, der in der übergebenen Node-Liste noch nicht vergeben ist */
+    private function uniqueIdent(string $nodeId, array $nodes): string
+    {
+        $used = [];
+        foreach ($nodes as $n) {
+            $used[$this->identOf($n)] = true;
+        }
+        $ident = OpenOPCUAHelper::ident($nodeId);
+        for ($i = 1; isset($used[$ident]); $i++) {
+            $ident = OpenOPCUAHelper::ident($nodeId . '#' . $i);
+        }
+        return $ident;
+    }
+
+    private function nodeRow(string $nodeId, string $name, string $path, int $builtin, bool $array, bool $writable, string $struct = '', string $ident = ''): array
     {
         return [
             'Struct'      => $struct,
-            'Ident'       => '',
+            'Ident'       => $ident,
             'Active'      => true,
             'Name'        => $name,
             'Path'        => $path,
