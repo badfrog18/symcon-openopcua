@@ -823,6 +823,16 @@ class OpenOPCUAClient extends IPSModule
         }
         $client = null;
         $keep = $this->ReadPropertyBoolean('KeepSession');
+        // Backoff nach Verbindungsfehlern: SPS nicht im Sekundentakt mit neuen Kanälen fluten
+        $backoffUntil = (float) $this->GetBuffer('BackoffUntil');
+        if ($backoffUntil > microtime(true)) {
+            IPS_SemaphoreLeave($sem);
+            $this->SendDebug($what, 'Übersprungen – Backoff nach Verbindungsfehler', 0);
+            if ($echoError) {
+                echo "❌ {$what} übersprungen: Verbindung gestört (Backoff)";
+            }
+            return null;
+        }
         try {
             $session = $keep ? json_decode($this->GetBuffer('Session'), true) : null;
             $client = OpenOPCUAHelper::connect($this->connectionConfig(is_array($session) ? $session : null));
@@ -830,14 +840,28 @@ class OpenOPCUAClient extends IPSModule
             $state = OpenOPCUAHelper::close($client, $keep);
             $client = null;
             $this->SetBuffer('Session', $state ? json_encode($state) : '');
+            $this->SetBuffer('BackoffUntil', '0');
+            $this->SetBuffer('FailCount', '0');
             if ($affectStatus) {
                 $this->setConnected(true);
             }
             return $result;
         } catch (\Throwable $e) {
-            OpenOPCUAHelper::close($client, false);
-            $this->SetBuffer('Session', '');
             $msg = $e->getMessage() ?: get_class($e);
+            // Session nur verwerfen, wenn der Server sie wirklich nicht mehr kennt.
+            // Bei Kanal-/Ressourcenfehlern (OPN ERR, BadTooManySessions, Timeout) bleibt die Session gültig –
+            // sie zu verwerfen und neu anzulegen hinterlässt verwaiste Sessions in der SPS (Session-Leck).
+            $sessionKaputt = (bool) preg_match('/BadSession|BadIdentity|BadUserAccess|BadSecurityChecks|BadCertificate|BadNonce/i', $msg);
+            if ($client !== null) {
+                // Session ist aktiv -> behalten (suspend), außer sie ist kaputt -> sauber schließen
+                $state = $sessionKaputt ? OpenOPCUAHelper::close($client, false) : OpenOPCUAHelper::close($client, $keep);
+                $this->SetBuffer('Session', ($state && !$sessionKaputt) ? json_encode($state) : ($sessionKaputt ? '' : $this->GetBuffer('Session')));
+            } elseif ($sessionKaputt || !$keep) {
+                $this->SetBuffer('Session', '');
+            }
+            $fails = (int) $this->GetBuffer('FailCount') + 1;
+            $this->SetBuffer('FailCount', (string) $fails);
+            $this->SetBuffer('BackoffUntil', (string) (microtime(true) + min(30, 2 ** min($fails, 5))));
             $this->SendDebug($what, 'Fehler: ' . $msg, 0);
             if ($affectStatus) {
                 $this->setConnected(false, $msg);
